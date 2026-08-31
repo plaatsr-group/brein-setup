@@ -36,21 +36,23 @@ if (-not $winget) {
 }
 Gelukt "winget gevonden"
 
-function Installeer($naam, $id) {
+function Installeer($naam, $idEnOpties) {
+    $id = ($idEnOpties -split " ")[0]
     $al = winget list --id $id -e --accept-source-agreements 2>$null | Select-String $id
     if ($al) { Gelukt "$naam staat er al"; return }
     Write-Host "   $naam installeren (dit kan even duren)..."
-    winget install --id $id -e --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
+    $args = @("install", "--id") + ($idEnOpties -split " ") + @("-e", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+    & winget @args | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "$naam installeren is niet gelukt (code $LASTEXITCODE)." }
     Gelukt "$naam geinstalleerd"
 }
 
 # ---- Stap 2: programma's installeren -------------------------
-Stap 2 "Git, Obsidian en Claude installeren"
+Stap 2 "Git en Obsidian installeren"
 Installeer "Git" "Git.Git"
-Installeer "Obsidian" "Obsidian.Obsidian"
-try { Installeer "Claude" "Anthropic.Claude" }
-catch { Probleem "Claude kon niet automatisch. Ga later naar claude.ai/download en installeer hem daar; de rest werkt gewoon door." }
+Installeer "Obsidian" "Obsidian.Obsidian --scope user"
+# Claude Desktop installeer je los via claude.com/download (stap 4 in de
+# handleiding): alleen die installer bevat Cowork, de map-functie die we nodig hebben.
 
 # ---- Stap 3: git vinden en instellen -------------------------
 Stap 3 "Git instellen op jouw naam"
