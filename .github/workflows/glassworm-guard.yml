@@ -1,0 +1,188 @@
+# GLASSWORM-GUARD:SELF-DEFINITION
+# GlassWorm / PolinRider CI guard. Self-contained: no third-party actions, no network
+# fetch, actions/checkout pinned to a full SHA. Drop this into any repo at
+# .github/workflows/glassworm-guard.yml. It fails the build if the worm loader, the
+# folderOpen trigger, or a disguised-font payload is present on the pushed ref.
+name: GlassWorm Guard
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+permissions:
+  contents: read
+jobs:
+  scan:
+    # 2026-09-12: Plaatsr repos run this on the org's own runner box (label
+    # plaatsr-ci); every other org keeps the GitHub-hosted runner. The scan
+    # itself is unchanged.
+    runs-on: ${{ github.repository_owner == 'plaatsr-group' && 'plaatsr-ci' || 'ubuntu-latest' }}
+    steps:
+      # actions/checkout v4.2.2, pinned by SHA (never a mutable tag).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # Full history so the secret scan below can scan exactly the commits of this push.
+          fetch-depth: 0
+      - name: Scan for GlassWorm/PolinRider IOCs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, re, sys
+          LOADER_SHA256 = {
+              "3287f2de563bd76465d353bd22b4d07c2af1cda9dd45efcb0da49e3ca49f7639",
+              "47353d2ce2724b3aa510bc5e304151d2f5af8b38aa188dd5664e10dc33aa3c1c",
+          }
+          MARKERS = [b"global['!']=", b"global['_V']=", b"global.i=\"A10",
+                     b"auth-confirm-nu.vercel.app",
+                     b"0xa322e5f3d311d3080e6f0121063e9adc2490ef1a", b"eth.blockscout.com"]
+          IOC_NAMES = {"temp_auto_push.bat","temp_interactive_push.bat","branch_structure.json"}
+          FONT_EXT = (".woff2",".woff",".ttf",".otf",".eot")
+          MAGIC = {".woff2":[b"wOF2"],".woff":[b"wOFF"],".ttf":[b"\x00\x01\x00\x00",b"true",b"ttcf",b"OTTO"],
+                   ".otf":[b"OTTO",b"\x00\x01\x00\x00"],".eot":None}
+          hits=[]
+          for root,dirs,files in os.walk("."):
+              dirs[:]=[d for d in dirs if d not in (".git","node_modules")]
+              for fn in files:
+                  p=os.path.join(root,fn); low=fn.lower()
+                  if low in IOC_NAMES: hits.append(("IOC_FILE",p))
+                  try:
+                      data=open(p,"rb").read(2_000_000)
+                  except OSError: continue
+                  if hashlib.sha256(data).hexdigest() in LOADER_SHA256: hits.append(("PAYLOAD",p))
+                  deesc=data.replace(b"\\u00",b"").replace(b"\\x",b"")
+                  # A file carrying the self-definition banner (this guard's own source) is exempt
+                  # from the marker-substring check ONLY; all strong signals below still run.
+                  is_self = b"GLASSWORM-GUARD:SELF-DEFINITION" in data
+                  if not is_self and any(m in data or m in deesc for m in MARKERS): hits.append(("MARKER",p))
+                  ext=os.path.splitext(low)[1]
+                  if ext in FONT_EXT:
+                      head=data[:64]; texty=b"\x00" not in head and len(head)>0
+                      mg=MAGIC.get(ext)
+                      bad=(texty if mg is None else (not any(head.startswith(x) for x in mg) and texty))
+                      if bad: hits.append(("FAKE_FONT",p))
+                  if low=="tasks.json" and ".vscode" in p.replace("\\","/"):
+                      t=data.decode("utf-8","replace")
+                      if re.search(r'"runOn"\s*:\s*"folderOpen"',t): hits.append(("FOLDEROPEN",p))
+                      if re.search(r'"task\.allowAutomaticTasks"\s*:\s*true',t): hits.append(("AUTOTASKS",p))
+                  # long leading-space run then code (padding trick), not a CSV/data row
+                  for line in data.split(b"\n",20)[:20]:
+                      i=0
+                      while i<len(line) and line[i:i+1]==b" ": i+=1
+                      if i>=200 and i<len(line):
+                          rest=line[i:i+80]
+                          if any(t in rest for t in (b"global",b"require",b"function",b"eval",b"var ")) \
+                             and not rest[:1].isdigit() and rest.count(b",")<=6:
+                              hits.append(("SPACE_PAD_CODE",p)); break
+          if hits:
+              print("::error::GlassWorm/PolinRider IOC detected")
+              for k,p in hits: print(f"  [{k}] {p}")
+              sys.exit(1)
+          print("GlassWorm guard: clean")
+          PY
+      # --- secret scan step (rolled out verbatim to every plaatsr-group repo) ---
+      # 2026-09-12, plaatsr-standard D59 point 8. GitHub Secret Protection is switched off (USD 19
+      # per committer, zero alerts in its lifetime while six real credentials slipped past it). This
+      # step is the server-side half of the gitleaks control; the global pre-commit hook on Martin's
+      # PC is the other half. Rules: agent-build-standard/security/gitleaks.toml, copied verbatim in
+      # the heredoc below, so a rules change is a template change is a rollout. Only the commits of
+      # THIS push are scanned (before..sha), so an old fixture in history never turns a repo red
+      # retroactively; a pull request scans base..head, a schedule run the last 20 commits. The
+      # binary is the one preinstalled on the runner box; a hosted runner downloads the pinned
+      # release and checks its sha256 first.
+      - name: Secret scan (gitleaks, D59.8)
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          V=8.30.1; SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          if command -v gitleaks >/dev/null 2>&1 && [ "$(gitleaks version 2>/dev/null)" = "$V" ]; then
+            GL=gitleaks
+          else
+            curl -fsSL -o /tmp/gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v$V/gitleaks_${V}_linux_x64.tar.gz"
+            echo "$SHA  /tmp/gl.tgz" | sha256sum -c - >/dev/null
+            tar -xzf /tmp/gl.tgz -C /tmp gitleaks; GL=/tmp/gitleaks
+          fi
+          cat > /tmp/gitleaks.toml <<'TOML'
+          # gitleaks rules for every Plaatsr repo (2026-09-12, plaatsr-standard D59 point 8).
+          # Source of truth is THIS file. The global pre-commit hook on Martin's PC reads it, and the
+          # GlassWorm Guard workflow (security/glassworm-guard.workflow.yml) carries a verbatim copy in
+          # its "Secret scan" step, so a change here is a change there in the same commit.
+          #
+          # The default gitleaks rules cover the provider shapes (AWS, GitHub, Anthropic, OpenAI, Slack,
+          # Stripe, JWT, generic api keys). The three rules below cover the shapes those miss and that
+          # actually leaked in this fleet (D34 audit, 2026-09-05): a value where a 1Password reference
+          # belongs, a tracked env file, and a database URL carrying a password.
+          # Regexes are RE2 (no lookahead), so exclusions live in allowlists with regexTarget = "line".
+
+          title = "plaatsr"
+
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "plaatsr-env-op-value"
+          description = "A .env.op file carries a literal value where an op:// reference belongs (kluis contract)"
+          path = '''\.env\.op$'''
+          regex = '''(?m)^([A-Z][A-Z0-9_]*)=([^\s#]{6,})\s*$'''
+          secretGroup = 2
+          keywords = ["="]
+          [[rules.allowlists]]
+          regexTarget = "line"
+          regexes = ['''=op://''']
+
+          [[rules]]
+          id = "plaatsr-tracked-env-file"
+          description = "A .env, .env.local, .env.production or .env.staging file is tracked with real values (values live in 1Password, references in .env.op)"
+          path = '''(^|[\\/])\.env(\.local|\.production|\.prod|\.staging|\.development)?$'''
+          regex = '''(?m)^([A-Z][A-Z0-9_]*)=([^\s#]{8,})\s*$'''
+          secretGroup = 2
+          keywords = ["="]
+          [[rules.allowlists]]
+          regexTarget = "line"
+          regexes = [
+            '''(?i)^[A-Z0-9_]+=(true|false|off|on|none|null|local|test|dev|development|production|staging|\d{1,5}|https?://(localhost|127\.0\.0\.1)[^\s]*|op://[^\s]+|\$\{[^}]+\}|<[^>]+>|xxx+|changeme|example|placeholder|your[-_])\s*$''',
+          ]
+
+          [[rules]]
+          id = "plaatsr-database-url-password"
+          description = "A database or broker URL with an embedded password"
+          regex = '''\b(postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql)://([^:/\s'"@]+):([^@\s'"]{4,})@'''
+          secretGroup = 3
+          keywords = ["postgres", "mysql", "mariadb", "mongodb", "redis", "amqp", "mssql"]
+          [[rules.allowlists]]
+          regexTarget = "line"
+          regexes = [
+            '''(?i)://[^:/\s'"@]+:(password|pass|pwd|secret|changeme|example|placeholder|xxx+|test|postgres|root|admin|\$\{[^}]+\}|<[^>]+>|%[sd]|\{\{[^}]+\}\})@''',
+            '''(?i)://[^@\s'"]+@(localhost|127\.0\.0\.1|db|postgres|database|host)(:\d+)?([/\s'"]|$)''',
+          ]
+
+          [[allowlists]]
+          description = "Things that are never a leak"
+          paths = [
+            '''(^|[\\/])node_modules[\\/]''',
+            '''(^|[\\/])\.git[\\/]''',
+            '''\.(png|jpg|jpeg|gif|webp|woff2?|ttf|otf|pdf|lock)$''',
+            '''(^|[\\/])package-lock\.json$''',
+            '''(^|[\\/])security[\\/]gitleaks\.toml$''',
+          ]
+          regexes = [
+            '''AKIAIOSFODNN7EXAMPLE''',
+            '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+          ]
+          TOML
+          case "$EVENT" in
+            push)
+              if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+                RANGE="$BEFORE..$GITHUB_SHA"
+              else
+                RANGE="-1"
+              fi ;;
+            pull_request) RANGE="$BASE..$GITHUB_SHA" ;;
+            *) RANGE="-20" ;;
+          esac
+          echo "gitleaks $V, range $RANGE"
+          "$GL" git --log-opts="$RANGE" --config /tmp/gitleaks.toml --no-banner --redact --exit-code 1 .
+      # --- end secret scan step ---
